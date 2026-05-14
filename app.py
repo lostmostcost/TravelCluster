@@ -153,6 +153,18 @@ def order_clustered_rows(clustered: pd.DataFrame, cluster_summary: pd.DataFrame)
     return ordered.drop(columns=["_cluster_order", "_noise_order"])
 
 
+def get_map_filter_options(cluster_summary: pd.DataFrame) -> dict[str, int | None]:
+    options: dict[str, int | None] = {
+        "전체 클러스터 보기": None,
+        "노이즈만 보기": -1,
+    }
+    for rank, row in enumerate(cluster_summary.itertuples(index=False), start=1):
+        cluster_id = int(row.cluster_id)
+        count = int(row.count)
+        options[f"{rank}위 - cluster {cluster_id} ({count:,}개)"] = cluster_id
+    return options
+
+
 def build_map(clustered: pd.DataFrame, cluster_label_order: list[str]):
     legend_order = [NOISE_LABEL, *cluster_label_order]
     cluster_colors = px.colors.qualitative.Alphabet
@@ -195,7 +207,7 @@ def build_map(clustered: pd.DataFrame, cluster_label_order: list[str]):
     return fig.update_layout(
         mapbox_style="open-street-map",
         margin={"r": 0, "t": 0, "l": 0, "b": 0},
-        legend_title_text="클러스터",
+        showlegend=False,
     )
 
 
@@ -368,7 +380,23 @@ def main() -> None:
         st.plotly_chart(build_category_average_chart(category_summary), use_container_width=True)
 
     st.subheader("대한민국 지도 기반 클러스터 시각화")
-    st.plotly_chart(build_map(ordered_clustered, cluster_label_order), use_container_width=True)
+    map_filter_options = get_map_filter_options(cluster_summary)
+    selected_map_filter = st.selectbox(
+        "지도에 표시할 클러스터",
+        options=list(map_filter_options),
+        help="클러스터는 규모 내림차순으로 정렬되어 있습니다.",
+    )
+    selected_cluster_id = map_filter_options[selected_map_filter]
+    if selected_cluster_id is None:
+        map_clustered = ordered_clustered[~ordered_clustered["is_noise"]]
+    else:
+        map_clustered = ordered_clustered[ordered_clustered["cluster_id"].eq(selected_cluster_id)]
+
+    if selected_cluster_id == -1:
+        st.caption("노이즈 데이터만 지도에 표시 중입니다.")
+    elif selected_cluster_id is not None:
+        st.caption(f"`{selected_map_filter}`만 지도에 표시 중입니다.")
+    st.plotly_chart(build_map(map_clustered, cluster_label_order), use_container_width=True)
 
     st.subheader("클러스터 요약")
     ratio_columns = [column for column in cluster_summary.columns if column.endswith("_ratio")]
