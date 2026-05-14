@@ -8,12 +8,20 @@ import plotly.express as px
 import streamlit as st
 from sklearn.cluster import DBSCAN
 
-from preprocess import OUTPUT_CSV, preprocess_travel_data
+from preprocess import OUTPUT_COLUMNS, OUTPUT_CSV, preprocess_travel_data
 
 
 EARTH_RADIUS_KM = 6371.0088
 LATITUDE_COLUMN = "여행지 위도"
 LONGITUDE_COLUMN = "여행지 경도"
+NOISE_LABEL = "noise"
+RESULT_COLUMNS = [
+    *OUTPUT_COLUMNS,
+    "cluster_id",
+    "is_noise",
+    "eps_km",
+    "min_samples",
+]
 
 
 @st.cache_data(show_spinner=False)
@@ -22,7 +30,11 @@ def load_processed_data(csv_path: str) -> pd.DataFrame:
     if not path.exists():
         preprocess_travel_data(output_path=path)
 
-    return pd.read_csv(path, encoding="utf-8-sig")
+    data = pd.read_csv(path, encoding="utf-8-sig")
+    if any(column not in data.columns for column in OUTPUT_COLUMNS):
+        data = preprocess_travel_data(output_path=path)
+
+    return data.loc[:, OUTPUT_COLUMNS]
 
 
 @st.cache_data(show_spinner=False)
@@ -44,7 +56,7 @@ def run_dbscan(df: pd.DataFrame, eps_km: float, min_samples: int) -> pd.DataFram
     result["min_samples"] = min_samples
     result["cluster_label"] = np.where(
         result["is_noise"],
-        "noise",
+        NOISE_LABEL,
         "cluster " + result["cluster_id"].astype(str),
     )
     return result
@@ -123,13 +135,40 @@ def summarize_clusters(clustered: pd.DataFrame) -> tuple[dict[str, float], pd.Da
     return metrics, summary, category_summary, noise_metrics, noise_summary
 
 
-def build_map(clustered: pd.DataFrame):
-    return px.scatter_mapbox(
+def get_cluster_label_order(cluster_summary: pd.DataFrame) -> list[str]:
+    return [f"cluster {cluster_id}" for cluster_id in cluster_summary["cluster_id"].tolist()]
+
+
+def order_clustered_rows(clustered: pd.DataFrame, cluster_summary: pd.DataFrame) -> pd.DataFrame:
+    cluster_order = {
+        cluster_id: order for order, cluster_id in enumerate(cluster_summary["cluster_id"].tolist())
+    }
+    ordered = clustered.assign(
+        _cluster_order=clustered["cluster_id"].map(cluster_order).fillna(len(cluster_order)),
+        _noise_order=clustered["is_noise"].astype(int),
+    ).sort_values(
+        ["_noise_order", "_cluster_order", "cluster_id", "여행지 id"],
+        ascending=[True, True, True, True],
+    )
+    return ordered.drop(columns=["_cluster_order", "_noise_order"])
+
+
+def build_map(clustered: pd.DataFrame, cluster_label_order: list[str]):
+    legend_order = [NOISE_LABEL, *cluster_label_order]
+    cluster_colors = px.colors.qualitative.Alphabet
+    color_map = {
+        label: cluster_colors[index % len(cluster_colors)]
+        for index, label in enumerate(cluster_label_order)
+    }
+    color_map[NOISE_LABEL] = "#9E9E9E"
+
+    fig = px.scatter_mapbox(
         clustered,
         lat=LATITUDE_COLUMN,
         lon=LONGITUDE_COLUMN,
         color="cluster_label",
-        color_discrete_sequence=px.colors.qualitative.Alphabet,
+        category_orders={"cluster_label": legend_order},
+        color_discrete_map=color_map,
         hover_name="여행지명칭",
         hover_data={
             "주소": True,
@@ -145,10 +184,43 @@ def build_map(clustered: pd.DataFrame):
         center={"lat": 36.2, "lon": 127.8},
         height=680,
         opacity=0.78,
-    ).update_layout(
+    )
+
+    for trace_index, trace in enumerate(fig.data):
+        if trace.name == NOISE_LABEL:
+            trace.update(legendgroup=NOISE_LABEL, legendrank=0, visible="legendonly")
+        else:
+            trace.update(legendgroup="clusters", legendrank=trace_index + 1)
+
+    return fig.update_layout(
         mapbox_style="open-street-map",
         margin={"r": 0, "t": 0, "l": 0, "b": 0},
         legend_title_text="클러스터",
+    )
+
+
+def build_category_average_chart(category_summary: pd.DataFrame):
+    chart_data = category_summary.sort_values("클러스터 평균 구성 비율", ascending=True)
+    fig = px.bar(
+        chart_data,
+        x="클러스터 평균 구성 비율",
+        y="분류",
+        orientation="h",
+        text="클러스터 평균 구성 비율",
+        color="클러스터 평균 구성 비율",
+        color_continuous_scale="Blues",
+    )
+    return fig.update_traces(
+        texttemplate="%{x:.1%}",
+        textposition="outside",
+        hovertemplate="분류=%{y}<br>평균 구성 비율=%{x:.1%}<extra></extra>",
+    ).update_layout(
+        height=360,
+        margin={"r": 24, "t": 8, "l": 0, "b": 0},
+        xaxis_title="평균 구성 비율",
+        yaxis_title=None,
+        xaxis_tickformat=".0%",
+        coloraxis_showscale=False,
     )
 
 
@@ -270,6 +342,8 @@ def main() -> None:
     with st.spinner("DBSCAN 군집을 계산하는 중입니다..."):
         clustered = run_dbscan(data, eps_km, min_samples)
         metrics, cluster_summary, category_summary, noise_metrics, noise_summary = summarize_clusters(clustered)
+        cluster_label_order = get_cluster_label_order(cluster_summary)
+        ordered_clustered = order_clustered_rows(clustered, cluster_summary)
 
     metric_columns = st.columns(5)
     metric_columns[0].metric("총 클러스터 수", f"{metrics['cluster_count']:,}개")
@@ -279,18 +353,22 @@ def main() -> None:
     metric_columns[4].metric("분류 항목 수", f"{len(category_summary):,}개")
 
     st.subheader("분류별 클러스터 평균 구성 비율")
-    st.dataframe(
-        category_summary.assign(
-            **{
-                "클러스터 평균 구성 비율": lambda frame: frame["클러스터 평균 구성 비율"].map("{:.1%}".format)
-            }
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
+    category_table_column, category_chart_column = st.columns([1, 1.2])
+    with category_table_column:
+        st.dataframe(
+            category_summary.assign(
+                **{
+                    "클러스터 평균 구성 비율": lambda frame: frame["클러스터 평균 구성 비율"].map("{:.1%}".format)
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    with category_chart_column:
+        st.plotly_chart(build_category_average_chart(category_summary), use_container_width=True)
 
     st.subheader("대한민국 지도 기반 클러스터 시각화")
-    st.plotly_chart(build_map(clustered), use_container_width=True)
+    st.plotly_chart(build_map(ordered_clustered, cluster_label_order), use_container_width=True)
 
     st.subheader("클러스터 요약")
     ratio_columns = [column for column in cluster_summary.columns if column.endswith("_ratio")]
@@ -315,29 +393,16 @@ def main() -> None:
     )
 
     st.subheader("현재 설정 결과 저장")
-    download_columns = [
-        "여행지 경도",
-        "여행지 위도",
-        "주소",
-        "지역구분",
-        "여행지명칭",
-        "분류",
-        "태그",
-        "cluster_id",
-        "is_noise",
-        "eps_km",
-        "min_samples",
-    ]
     file_name = f"clustered_travel_destinations_eps_{eps_km:.1f}_min_{min_samples}.csv"
     st.download_button(
         "현재 클러스터 결과 CSV 다운로드",
-        data=to_csv_bytes(clustered[download_columns]),
+        data=to_csv_bytes(ordered_clustered[RESULT_COLUMNS]),
         file_name=file_name,
         mime="text/csv",
     )
 
     with st.expander("결과 데이터 미리보기"):
-        st.dataframe(clustered[download_columns].head(200), use_container_width=True, hide_index=True)
+        st.dataframe(ordered_clustered[RESULT_COLUMNS].head(200), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":

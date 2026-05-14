@@ -19,6 +19,16 @@ KEEP_COLUMNS = [
     "분류",
     "태그",
 ]
+OUTPUT_COLUMNS = [
+    "여행지 id",
+    "여행지명칭",
+    "분류",
+    "태그",
+    "지역구분",
+    "주소",
+    "여행지 경도",
+    "여행지 위도",
+]
 
 
 def read_source_csv(path: Path = SOURCE_CSV) -> pd.DataFrame:
@@ -61,6 +71,8 @@ def preprocess_travel_data(
         & processed["여행지 위도"].between(32.0, 39.5)
     ]
     processed = processed.drop_duplicates().reset_index(drop=True)
+    processed.insert(0, "여행지 id", [f"TRAVEL_{index:06d}" for index in range(1, len(processed) + 1)])
+    processed = processed.loc[:, OUTPUT_COLUMNS]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     processed.to_csv(output_path, index=False, encoding="utf-8-sig")
