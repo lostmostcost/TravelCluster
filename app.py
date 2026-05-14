@@ -216,7 +216,8 @@ def build_map(clustered: pd.DataFrame, cluster_label_order: list[str]):
 
     for trace_index, trace in enumerate(fig.data):
         if trace.name == NOISE_LABEL:
-            trace.update(legendgroup=NOISE_LABEL, legendrank=0, visible="legendonly")
+            visible = True if len(fig.data) == 1 else "legendonly"
+            trace.update(legendgroup=NOISE_LABEL, legendrank=0, visible=visible)
         else:
             trace.update(legendgroup="clusters", legendrank=trace_index + 1)
 
