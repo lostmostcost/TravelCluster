@@ -66,6 +66,29 @@ def get_category_columns(categories: list[str]) -> list[str]:
     return [f"{category}_ratio" for category in categories]
 
 
+def summarize_category_averages(cluster_summary: pd.DataFrame) -> pd.DataFrame:
+    ratio_columns = [column for column in cluster_summary.columns if column.endswith("_ratio")]
+    if cluster_summary.empty:
+        average_ratios = dict.fromkeys(ratio_columns, 0.0)
+    else:
+        average_ratios = {column: float(cluster_summary[column].mean()) for column in ratio_columns}
+
+    return pd.DataFrame(
+        {
+            "분류": [column.removesuffix("_ratio") for column in ratio_columns],
+            "클러스터 평균 구성 비율": [average_ratios[column] for column in ratio_columns],
+        }
+    ).sort_values("클러스터 평균 구성 비율", ascending=False)
+
+
+def get_top_percent_cluster_summary(cluster_summary: pd.DataFrame, percent: float) -> pd.DataFrame:
+    if cluster_summary.empty:
+        return cluster_summary.copy()
+
+    top_count = max(1, int(np.ceil(len(cluster_summary) * percent)))
+    return cluster_summary.head(top_count).copy()
+
+
 def summarize_noise(clustered: pd.DataFrame, categories: list[str]) -> tuple[dict[str, float], pd.DataFrame]:
     noise_points = clustered[clustered["is_noise"]]
     total_count = len(clustered)
@@ -98,7 +121,6 @@ def summarize_clusters(clustered: pd.DataFrame) -> tuple[dict[str, float], pd.Da
     clustered_count = len(clustered_points)
     cluster_count = int(clustered_points["cluster_id"].nunique())
     included_ratio = clustered_count / total_count if total_count else 0.0
-    category_averages = dict.fromkeys(category_columns, 0.0)
 
     if clustered_points.empty:
         summary = pd.DataFrame(columns=["cluster_id", "count", *category_columns])
@@ -119,18 +141,12 @@ def summarize_clusters(clustered: pd.DataFrame) -> tuple[dict[str, float], pd.Da
         summary = counts.merge(category_ratios.reset_index(), on="cluster_id", how="left")
         summary[category_columns] = summary[category_columns].fillna(0.0)
         summary = summary.sort_values(["count", "cluster_id"], ascending=[False, True])
-        category_averages = {column: float(summary[column].mean()) for column in category_columns}
 
     metrics = {
         "cluster_count": cluster_count,
         "included_ratio": included_ratio,
     }
-    category_summary = pd.DataFrame(
-        {
-            "분류": categories,
-            "클러스터 평균 구성 비율": [category_averages[f"{category}_ratio"] for category in categories],
-        }
-    ).sort_values("클러스터 평균 구성 비율", ascending=False)
+    category_summary = summarize_category_averages(summary)
     noise_metrics, noise_summary = summarize_noise(clustered, categories)
     return metrics, summary, category_summary, noise_metrics, noise_summary
 
@@ -234,6 +250,62 @@ def build_category_average_chart(category_summary: pd.DataFrame):
         xaxis_tickformat=".0%",
         coloraxis_showscale=False,
     )
+
+
+def render_category_summary(summary: pd.DataFrame) -> None:
+    category_table_column, category_chart_column = st.columns([1, 1.2])
+    with category_table_column:
+        st.dataframe(
+            summary.assign(
+                **{
+                    "클러스터 평균 구성 비율": lambda frame: frame["클러스터 평균 구성 비율"].map("{:.1%}".format)
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    with category_chart_column:
+        st.plotly_chart(build_category_average_chart(summary), use_container_width=True)
+
+
+def build_noise_category_chart(noise_summary: pd.DataFrame):
+    chart_data = noise_summary.sort_values("노이즈 구성 비율", ascending=True)
+    fig = px.bar(
+        chart_data,
+        x="노이즈 구성 비율",
+        y="분류",
+        orientation="h",
+        text="노이즈 구성 비율",
+        color="노이즈 구성 비율",
+        color_continuous_scale="Greys",
+    )
+    return fig.update_traces(
+        texttemplate="%{x:.1%}",
+        textposition="outside",
+        hovertemplate="분류=%{y}<br>노이즈 구성 비율=%{x:.1%}<br>데이터 수=%{customdata:,}개<extra></extra>",
+        customdata=chart_data["노이즈 데이터 수"],
+    ).update_layout(
+        height=360,
+        margin={"r": 24, "t": 8, "l": 0, "b": 0},
+        xaxis_title="노이즈 구성 비율",
+        yaxis_title=None,
+        xaxis_tickformat=".0%",
+        coloraxis_showscale=False,
+    )
+
+
+def render_noise_summary(noise_summary: pd.DataFrame) -> None:
+    noise_table_column, noise_chart_column = st.columns([1, 1.2])
+    with noise_table_column:
+        st.dataframe(
+            noise_summary.assign(
+                **{"노이즈 구성 비율": lambda frame: frame["노이즈 구성 비율"].map("{:.1%}".format)}
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    with noise_chart_column:
+        st.plotly_chart(build_noise_category_chart(noise_summary), use_container_width=True)
 
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -356,6 +428,8 @@ def main() -> None:
         metrics, cluster_summary, category_summary, noise_metrics, noise_summary = summarize_clusters(clustered)
         cluster_label_order = get_cluster_label_order(cluster_summary)
         ordered_clustered = order_clustered_rows(clustered, cluster_summary)
+        top_5_cluster_summary = get_top_percent_cluster_summary(cluster_summary, 0.05)
+        top_5_category_summary = summarize_category_averages(top_5_cluster_summary)
 
     metric_columns = st.columns(5)
     metric_columns[0].metric("총 클러스터 수", f"{metrics['cluster_count']:,}개")
@@ -365,19 +439,19 @@ def main() -> None:
     metric_columns[4].metric("분류 항목 수", f"{len(category_summary):,}개")
 
     st.subheader("분류별 클러스터 평균 구성 비율")
-    category_table_column, category_chart_column = st.columns([1, 1.2])
-    with category_table_column:
-        st.dataframe(
-            category_summary.assign(
-                **{
-                    "클러스터 평균 구성 비율": lambda frame: frame["클러스터 평균 구성 비율"].map("{:.1%}".format)
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
+    all_category_tab, top_5_category_tab, noise_category_tab = st.tabs(
+        ["전체 클러스터", "상위 5% 규모 클러스터", "클러스터 미포함 데이터"]
+    )
+    with all_category_tab:
+        render_category_summary(category_summary)
+    with top_5_category_tab:
+        st.caption(
+            f"규모순 상위 {len(top_5_cluster_summary):,}개 / 전체 {len(cluster_summary):,}개 클러스터 기준입니다."
         )
-    with category_chart_column:
-        st.plotly_chart(build_category_average_chart(category_summary), use_container_width=True)
+        render_category_summary(top_5_category_summary)
+    with noise_category_tab:
+        st.caption("DBSCAN에서 `cluster_id = -1`은 설정한 반경과 최소 기준으로 어떤 클러스터에도 포함되지 못한 노이즈 데이터입니다.")
+        render_noise_summary(noise_summary)
 
     st.subheader("대한민국 지도 기반 클러스터 시각화")
     map_filter_options = get_map_filter_options(cluster_summary)
@@ -406,16 +480,6 @@ def main() -> None:
 
     st.dataframe(
         formatted_cluster_summary,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.subheader("클러스터 미포함 데이터 통계 (cluster_id = -1)")
-    st.caption("DBSCAN에서 `cluster_id = -1`은 설정한 반경과 최소 기준으로 어떤 클러스터에도 포함되지 못한 노이즈 데이터입니다.")
-    st.dataframe(
-        noise_summary.assign(
-            **{"노이즈 구성 비율": lambda frame: frame["노이즈 구성 비율"].map("{:.1%}".format)}
-        ),
         use_container_width=True,
         hide_index=True,
     )
